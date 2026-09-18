@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YouTube Downloader</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="heading">
+          <p class="eyebrow">YouTube Downloader</p>
+          <h1>Paste a video link. Pick quality. Download.</h1>
+        </div>
+
+        <form class="search" id="videoForm">
+          <input id="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" required>
+          <button type="submit">Load qualities</button>
+        </form>
+
+        <p class="status" id="status" role="status"></p>
+      </section>
+
+      <section class="result hidden" id="result">
+        <div class="video">
+          <img id="thumbnail" alt="">
+          <div>
+            <h2 id="title"></h2>
+            <p id="meta"></p>
+          </div>
+        </div>
+
+        <div class="formats" id="formats"></div>
+      </section>
+    </main>
+  </body>
+</html>
