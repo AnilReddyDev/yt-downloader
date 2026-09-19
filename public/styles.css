@@ -114,6 +114,12 @@ button:disabled {
   opacity: 0.7;
 }
 
+.download.disabled {
+  cursor: wait;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
 .status {
   min-height: 24px;
   margin: 18px 0 0;
@@ -123,6 +129,20 @@ button:disabled {
 .status.error {
   color: #c3322b;
   font-weight: 700;
+}
+
+.logs {
+  max-height: 320px;
+  overflow: auto;
+  margin: 16px 0 0;
+  padding: 14px;
+  border: 1px solid #dbe4dd;
+  border-radius: 8px;
+  background: #10201c;
+  color: #d8f2e5;
+  font: 0.82rem/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .result {

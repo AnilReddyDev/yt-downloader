@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,89 @@ const ffmpegBinaryPath = ffmpegPath || "";
 
 app.use(express.json());
 app.use(express.static("public"));
+
+const log = (level, event, details = {}) => {
+  const payload = {
+    level,
+    event,
+    timestamp: new Date().toISOString(),
+    ...details
+  };
+
+  const output = JSON.stringify(payload);
+  if (level === "error") {
+    console.error(output);
+  } else {
+    console.log(output);
+  }
+
+  return payload;
+};
+
+function createResponseLogger() {
+  const logs = [];
+
+  return {
+    logs,
+    write(level, event, details = {}) {
+      const entry = log(level, event, details);
+      logs.push(entry);
+      return entry;
+    }
+  };
+}
+
+function createRequestContext(req) {
+  return {
+    requestId: randomUUID().slice(0, 8),
+    method: req.method,
+    path: req.path,
+    userAgent: req.get("user-agent") || "",
+    renderService: process.env.RENDER_SERVICE_NAME || "",
+    renderInstance: process.env.RENDER_INSTANCE_ID || ""
+  };
+}
+
+function serializeError(error) {
+  return {
+    name: error?.name || "Error",
+    message: error?.message || String(error),
+    stack: error?.stack,
+    stderr: error?.stderr,
+    stdout: error?.stdout,
+    code: error?.code,
+    signal: error?.signal
+  };
+}
+
+function getClientErrorMessage(error, fallback) {
+  const raw = [error?.stderr, error?.message, String(error || "")]
+    .filter(Boolean)
+    .join("\n");
+
+  if (/sign in to confirm|not a bot|cookies|captcha|confirm you'?re not a bot/i.test(raw)) {
+    return "YouTube is blocking this server request. Render free-tier/datacenter IPs are often challenged by YouTube.";
+  }
+
+  if (/private video|members-only|unavailable|video unavailable/i.test(raw)) {
+    return "This video is unavailable to the server. Try a public video link.";
+  }
+
+  if (/timed out|timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|network/i.test(raw)) {
+    return "The server could not reach YouTube reliably. Try again after the Render service is awake.";
+  }
+
+  return fallback;
+}
+
+function sendJsonError(res, status, requestId, message, detail, logs = []) {
+  res.status(status).json({
+    error: message,
+    requestId,
+    detail,
+    logs
+  });
+}
 
 app.get("/health", (_req, res) => {
   res.send("ok");
@@ -129,47 +213,106 @@ async function assertBinaryExists(filePath, name) {
 }
 
 app.post("/api/formats", async (req, res) => {
+  const context = createRequestContext(req);
+  const responseLogger = createResponseLogger();
   const url = req.body?.url?.trim();
 
+  res.setHeader("x-request-id", context.requestId);
+
   if (!isValidYouTubeUrl(url)) {
-    return res.status(400).json({ error: "Paste a valid YouTube video link." });
+    responseLogger.write("warn", "formats.invalid_url", context);
+    return sendJsonError(
+      res,
+      400,
+      context.requestId,
+      "Paste a valid YouTube video link.",
+      undefined,
+      responseLogger.logs
+    );
   }
 
   try {
+    responseLogger.write("info", "formats.start", { ...context, url });
     await assertBinaryExists(ytdlpPath, "yt-dlp");
     const info = await getVideoInfo(url);
+    const availableFormats = getDownloadableFormats(info).map(mapFormat);
+
+    responseLogger.write("info", "formats.success", {
+      ...context,
+      title: info.title,
+      duration: Number(info.duration || 0),
+      formats: availableFormats.length
+    });
 
     res.json({
       title: info.title,
       author: info.uploader || info.channel || "YouTube",
       thumbnail: info.thumbnail || info.thumbnails?.at(-1)?.url || "",
       duration: Number(info.duration || 0),
-      formats: getDownloadableFormats(info).map(mapFormat)
+      formats: availableFormats,
+      requestId: context.requestId,
+      logs: responseLogger.logs
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
-      error: "Could not load video qualities. Try another public YouTube link."
+    const message = getClientErrorMessage(
+      error,
+      "Could not load video qualities. Try another public YouTube link."
+    );
+
+    responseLogger.write("error", "formats.failure", {
+      ...context,
+      url,
+      error: serializeError(error)
     });
+
+    sendJsonError(res, 500, context.requestId, message, undefined, responseLogger.logs);
   }
 });
 
 app.get("/download", async (req, res) => {
+  const context = createRequestContext(req);
+  const responseLogger = createResponseLogger();
   const url = String(req.query.url || "").trim();
   const formatId = String(req.query.format || "");
+  const wantsJson = req.accepts(["json", "html", "text"]) === "json";
+
+  res.setHeader("x-request-id", context.requestId);
 
   if (!isValidYouTubeUrl(url) || !formatId) {
-    return res.status(400).send("Invalid download request.");
+    responseLogger.write("warn", "download.invalid_request", context);
+    if (wantsJson) {
+      return sendJsonError(
+        res,
+        400,
+        context.requestId,
+        "Invalid download request.",
+        undefined,
+        responseLogger.logs
+      );
+    }
+    return res.status(400).send(`Invalid download request. Request id: ${context.requestId}`);
   }
 
   try {
+    responseLogger.write("info", "download.start", { ...context, url, formatId });
     await assertBinaryExists(ytdlpPath, "yt-dlp");
     await assertBinaryExists(ffmpegBinaryPath, "ffmpeg");
     const info = await getVideoInfo(url);
     const format = getDownloadableFormats(info).find((item) => item.format_id === formatId);
 
     if (!format) {
-      return res.status(404).send("That quality is not available anymore.");
+      responseLogger.write("warn", "download.format_missing", { ...context, url, formatId });
+      if (wantsJson) {
+        return sendJsonError(
+          res,
+          404,
+          context.requestId,
+          "That quality is not available anymore.",
+          undefined,
+          responseLogger.logs
+        );
+      }
+      return res.status(404).send(`That quality is not available anymore. Request id: ${context.requestId}`);
     }
 
     const title = cleanTitle(info.title);
@@ -193,16 +336,58 @@ app.get("/download", async (req, res) => {
     }
 
     const download = spawn(ytdlpPath, args);
+    let stderr = "";
+    let stdout = "";
 
-    download.stderr.on("data", (data) => console.error(String(data)));
-    download.on("error", async () => {
+    download.stdout.on("data", (data) => {
+      stdout += String(data);
+    });
+    download.stderr.on("data", (data) => {
+      stderr += String(data);
+    });
+    download.on("error", async (error) => {
       await fs.rm(tempDir, { recursive: true, force: true });
-      if (!res.headersSent) res.status(500).send("Download failed.");
+      responseLogger.write("error", "download.spawn_error", {
+        ...context,
+        url,
+        formatId,
+        error: serializeError(error),
+        stderr,
+        stdout
+      });
+      if (!res.headersSent) {
+        const message = getClientErrorMessage(error, "Download failed.");
+        if (wantsJson) {
+          sendJsonError(res, 500, context.requestId, message, undefined, responseLogger.logs);
+        } else {
+          res.status(500).send(`${message} Request id: ${context.requestId}`);
+        }
+      }
     });
     download.on("close", async (code) => {
       if (code !== 0) {
         await fs.rm(tempDir, { recursive: true, force: true });
-        if (!res.headersSent) res.status(500).send("Download failed.");
+        const error = new Error(`yt-dlp exited with code ${code}`);
+        error.stderr = stderr;
+        error.stdout = stdout;
+
+        responseLogger.write("error", "download.process_failed", {
+          ...context,
+          url,
+          formatId,
+          exitCode: code,
+          stderr,
+          stdout
+        });
+
+        if (!res.headersSent) {
+          const message = getClientErrorMessage(error, "Download failed.");
+          if (wantsJson) {
+            sendJsonError(res, 500, context.requestId, message, undefined, responseLogger.logs);
+          } else {
+            res.status(500).send(`${message} Request id: ${context.requestId}`);
+          }
+        }
         return;
       }
 
@@ -211,23 +396,77 @@ app.get("/download", async (req, res) => {
 
       if (!file) {
         await fs.rm(tempDir, { recursive: true, force: true });
-        if (!res.headersSent) res.status(500).send("Download failed.");
+        responseLogger.write("error", "download.output_missing", {
+          ...context,
+          url,
+          formatId,
+          stderr,
+          stdout,
+          files
+        });
+        if (!res.headersSent) {
+          if (wantsJson) {
+            sendJsonError(res, 500, context.requestId, "Download failed.", undefined, responseLogger.logs);
+          } else {
+            res.status(500).send(`Download failed. Request id: ${context.requestId}`);
+          }
+        }
         return;
       }
 
       const filePath = path.join(tempDir, file);
-      res.download(filePath, `${title}.${path.extname(file).slice(1) || extension}`, async () => {
+      const filename = `${title}.${path.extname(file).slice(1) || extension}`;
+      responseLogger.write("info", "download.success", {
+        ...context,
+        url,
+        formatId,
+        filename
+      });
+      res.download(filePath, filename, async (error) => {
         await fs.rm(tempDir, { recursive: true, force: true });
+        if (error) {
+          responseLogger.write("error", "download.response_error", {
+            ...context,
+            url,
+            formatId,
+            error: serializeError(error)
+          });
+        }
       });
     });
   } catch (error) {
-    console.error(error);
-    res.status(500).send("Download failed. Try refreshing the qualities and downloading again.");
+    const message = getClientErrorMessage(
+      error,
+      "Download failed. Try refreshing the qualities and downloading again."
+    );
+
+    responseLogger.write("error", "download.failure", {
+      ...context,
+      url,
+      formatId,
+      error: serializeError(error)
+    });
+
+    if (wantsJson) {
+      sendJsonError(res, 500, context.requestId, message, undefined, responseLogger.logs);
+    } else {
+      res.status(500).send(`${message} Request id: ${context.requestId}`);
+    }
   }
 });
 
 const server = app.listen(port, host, () => {
   console.log(`YouTube downloader running at http://${host}:${port}`);
+  log("info", "server.started", {
+    port,
+    host,
+    node: process.version,
+    platform: process.platform,
+    ytdlpPath,
+    ffmpegBinaryPath,
+    renderService: process.env.RENDER_SERVICE_NAME || "",
+    renderInstance: process.env.RENDER_INSTANCE_ID || ""
+  });
 });
 
 server.on("error", (error) => {
